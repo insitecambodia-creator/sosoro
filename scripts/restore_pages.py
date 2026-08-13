@@ -262,14 +262,60 @@ def _estimate_skew_angle(gray: np.ndarray, search_deg: float = 8.0) -> float:
     return best_angle
 
 
-def deskew(img: np.ndarray) -> np.ndarray:
-    """Straighten the page by rotating out its overall text-line tilt."""
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    angle = _estimate_skew_angle(gray)
+def _estimate_row_dependent_angle(gray: np.ndarray, nbands: int = 6) -> tuple[float, float]:
+    """Estimate text-line tilt as a function of vertical page position:
+    angle(y) = m*y + k.
+
+    A single global angle assumes every line needs the same correction,
+    but that's often not true on a photographed page — e.g. a page
+    propped at a slight angle to the camera produces a genuine
+    perspective shear where lines near the top of the frame need a
+    different correction than lines near the bottom. Measuring baseline
+    position pixel-by-pixel to detect this directly turned out to be too
+    noisy (ascenders/descenders swing a single column's ink centroid by
+    dozens of pixels). Instead, this reuses the robust whole-page
+    projection-profile method (`_estimate_skew_angle`), just run
+    independently on horizontal bands of the page — still an aggregate,
+    noise-resistant measurement, but now localized enough to reveal how
+    the tilt changes with row position. Falls back to a flat line (pure
+    global rotation, m=0) if there isn't enough text to split into bands
+    reliably.
+    """
     h, w = gray.shape
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC,
-                           borderMode=cv2.BORDER_REPLICATE)
+    band_h = h // nbands
+    centers, angles = [], []
+    for i in range(nbands):
+        y0, y1 = i * band_h, min(h, (i + 1) * band_h)
+        band = gray[y0:y1, :]
+        _, bw = cv2.threshold(band, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        if (bw > 0).mean() < 0.01:
+            continue  # near-blank band — not enough text to measure
+        centers.append((y0 + y1) / 2)
+        angles.append(_estimate_skew_angle(band))
+
+    if len(centers) < 4:
+        return 0.0, _estimate_skew_angle(gray)
+
+    centers_arr, angles_arr = np.array(centers), np.array(angles)
+    A = np.vstack([centers_arr, np.ones(len(centers_arr))]).T
+    m, k = np.linalg.lstsq(A, angles_arr, rcond=None)[0]
+    return float(m), float(k)
+
+
+def deskew(img: np.ndarray) -> np.ndarray:
+    """Straighten the page using a (possibly row-position-dependent)
+    text-line angle (see `_estimate_row_dependent_angle`)."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    m, k = _estimate_row_dependent_angle(gray)
+
+    cx = w / 2.0
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    angle_per_row = m * yy + k
+    ratio_per_row = np.tan(np.radians(angle_per_row)).astype(np.float32)
+    map_y = yy + ratio_per_row * (xx - np.float32(cx))
+    return cv2.remap(img, xx, map_y, interpolation=cv2.INTER_CUBIC,
+                      borderMode=cv2.BORDER_REPLICATE)
 
 
 # --------------------------------------------------------------------------
